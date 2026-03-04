@@ -8,7 +8,7 @@ from typing import Any
 import gradio as gr
 
 
-BACKEND_PATH = Path(__file__).with_name("1.3_main.py")
+BACKEND_PATH = Path(__file__).with_name("1.4_main.py")
 MAX_LOG_LINES = 300
 MAX_TEXT_HISTORY_LINES = 120
 THRESHOLD_MIN = 100
