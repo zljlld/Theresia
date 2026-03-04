@@ -1,6 +1,14 @@
 import requests
 import json
 import time
+import re
+import asyncio
+import threading
+import sys
+import traceback
+from datetime import datetime, timedelta
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
 def call_deepseek_api(
     api_key: str,
@@ -83,11 +91,10 @@ def call_deepseek_api(
         "model": model,
         "messages": api_messages,  # 使用过滤后的对话历史，支持多轮对话
         "think": True,           # 核心：开启DeepSeek的推理/思考模式
-        "max_new_tokens": 200,   # 增加输出长度，支持更详细的回答
+        "max_new_tokens": 600,   # 增加输出长度，减少回答被截断的概率
         "temperature": 0.7,      # 适当增加随机性，提高回答质量
         "top_p": 0.9,            # 扩大采样范围，增加回答多样性
         "stream": stream,        # 开启流式输出，逐字返回
-        "stop": ["\n\n"]        # 调整停止条件，允许推理和步骤
     }
 
     try:
@@ -141,6 +148,200 @@ def call_deepseek_api(
 if __name__ == "__main__":
     # 替换为你的API Key（从https://platform.deepseek.com/获取）
     YOUR_API_KEY = "sk-ed73e601ff574217839a9568bc902498"
+    # 直接在脚本中填写 Tavily Key；留空则不使用 Tavily。
+    TAVILY_API_KEY = "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"
+
+    def parse_mcp_call_result(result) -> object:
+        """
+        将 MCP call_tool 返回对象尽可能解析为 Python 对象。
+        """
+        # 1) SDK对象直接取 content
+        content = getattr(result, "content", None)
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                text = getattr(item, "text", None)
+                if text is not None:
+                    text_parts.append(text)
+            if text_parts:
+                merged = "\n".join(text_parts).strip()
+                try:
+                    return json.loads(merged)
+                except Exception:
+                    return merged
+
+        # 2) 尝试 model_dump
+        if hasattr(result, "model_dump"):
+            dumped = result.model_dump()
+            if isinstance(dumped, dict) and "content" in dumped and isinstance(dumped["content"], list):
+                text_parts = []
+                for item in dumped["content"]:
+                    if isinstance(item, dict) and "text" in item:
+                        text_parts.append(str(item["text"]))
+                if text_parts:
+                    merged = "\n".join(text_parts).strip()
+                    try:
+                        return json.loads(merged)
+                    except Exception:
+                        return merged
+            return dumped
+
+        return result
+
+    async def call_mcp_tool_once(tool_name: str, arguments: dict) -> object:
+        """
+        标准 MCP stdio 流程：
+        initialize -> tools/call
+        """
+        server = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "MCP_Server.server"],
+        )
+        async with stdio_client(server) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                result = await session.call_tool(tool_name, arguments or {})
+                return parse_mcp_call_result(result)
+
+    def call_mcp_tool(tool_name: str, arguments: dict) -> object:
+        return asyncio.run(call_mcp_tool_once(tool_name, arguments or {}))
+
+    def run_memory_manager():
+        """通过标准 MCP 工具执行记忆整理"""
+        try:
+            result = call_mcp_tool("manage_memories", {
+                "api_key": YOUR_API_KEY,
+                "prompt_file": "system_prompt.txt",
+                "model": "deepseek-chat",
+                "dry_run": False,
+            })
+            if isinstance(result, dict) and result.get("status") == "no_change":
+                print("[记忆管理] NO（无需修改）")
+            else:
+                if isinstance(result, dict):
+                    print(f"[记忆管理] 管理指令: {result.get('answer', '')}")
+                    print(f"[记忆管理] 变更条数: {result.get('changed_count', 0)}")
+                else:
+                    print(f"[记忆管理] 结果: {result}")
+        except Exception as e:
+            print(f"[记忆管理] 调用异常: {e}")
+
+    def start_daily_memory_manager():
+        """每天零点自动执行一次记忆整理"""
+        def _worker():
+            while True:
+                now = datetime.now()
+                next_midnight = (now + timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                sleep_seconds = (next_midnight - now).total_seconds()
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
+                run_memory_manager()
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+
+    def execute_mcp_tool(tool_name: str, arguments: dict):
+        """通过标准 MCP stdio 客户端执行工具"""
+        arguments = arguments or {}
+        if tool_name == "manage_memories":
+            # 安全起见：忽略模型传入的api_key，始终使用本地配置
+            arguments["api_key"] = YOUR_API_KEY
+            arguments.setdefault("prompt_file", "system_prompt.txt")
+            arguments.setdefault("model", "deepseek-chat")
+            arguments.setdefault("dry_run", False)
+        if tool_name == "web_search":
+            # 优先使用本地 Tavily key，避免模型传入错误 key
+            if TAVILY_API_KEY:
+                arguments["api_key"] = TAVILY_API_KEY
+
+        return call_mcp_tool(tool_name, arguments)
+
+    def extract_first_json_object(text: str):
+        """从文本中提取第一个 JSON 对象"""
+        if not text:
+            return None
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        json_str = text[start:end + 1]
+        try:
+            return json.loads(json_str)
+        except Exception:
+            return None
+
+    def maybe_route_and_call_mcp(user_question: str) -> str:
+        """
+        AI 自主工具选择模式：
+        先让模型决定是否调用工具，再执行 MCP 工具并把结果注入本轮问题。
+        """
+        router_prompt = f"""
+你是工具路由器。请判断是否需要调用工具帮助回答用户。
+
+可用工具：
+1) echo(text: str) - 原样返回文本
+2) read_memory_lines(prompt_file: str = "system_prompt.txt") - 读取记忆行
+3) manage_memories(api_key: str, prompt_file: str = "system_prompt.txt", model: str = "deepseek-chat", dry_run: bool = false) - 执行记忆管理
+4) web_search(query: str, max_results: int = 5) - 联网搜索并返回结果列表
+
+如果不需要工具，请只输出：
+{{"use_tool": false}}
+
+如果需要工具，请只输出：
+{{"use_tool": true, "tool_name": "工具名", "arguments": {{参数键值对}}}}
+
+禁止输出除 JSON 外的任何内容。
+
+用户输入：{user_question}
+""".strip()
+
+        try:
+            route_answer, _ = call_deepseek_api(
+                YOUR_API_KEY,
+                router_prompt,
+                stream=False,
+                chat_history=None,
+                system_prompt=""
+            )
+            route_obj = extract_first_json_object(route_answer)
+            if not isinstance(route_obj, dict):
+                return user_question
+
+            if not route_obj.get("use_tool"):
+                return user_question
+
+            tool_name = str(route_obj.get("tool_name", "")).strip()
+            arguments = route_obj.get("arguments", {})
+            if not tool_name:
+                return user_question
+
+            # 工具调用前先给出过渡回复，避免用户等待时无反馈
+            if tool_name == "web_search":
+                print("Theresia：我看看，等我查一下。")
+            elif tool_name == "manage_memories":
+                print("Theresia：我先整理一下记忆，稍等。")
+            else:
+                print("Theresia：稍等，我来处理一下。")
+
+            tool_result = execute_mcp_tool(tool_name, arguments if isinstance(arguments, dict) else {})
+            printable_result = tool_result
+            if isinstance(tool_result, (dict, list)):
+                printable_result = json.dumps(tool_result, ensure_ascii=False)
+
+            print(f"[MCP] 已调用工具: {tool_name}")
+            return (
+                f"{user_question}\n\n"
+                f"[MCP工具调用结果]\n"
+                f"工具: {tool_name}\n"
+                f"参数: {json.dumps(arguments, ensure_ascii=False)}\n"
+                f"结果: {printable_result}"
+            )
+        except Exception as e:
+            print(f"[MCP] 工具调用失败，回退普通回答: {e}")
+            print(f"[MCP] 详细错误: {traceback.format_exc()}")
+            return user_question
     
     # 初始读取提示词
     current_prompt = ""
@@ -167,8 +368,8 @@ if __name__ == "__main__":
             lines = initial_prompt.split("\n")
             updated_lines = []
             
-            # 获取当前时间戳
-            current_timestamp = time.time()
+            # 获取当前时间
+            current_dt = datetime.now()
             
             for line in lines:
                 # 检查是否是记忆行，格式：<时间> 内容 结尾带有<年/月/日/小时:分钟>
@@ -179,11 +380,10 @@ if __name__ == "__main__":
                         if end_time_pos != -1:
                             end_time_str = line[end_time_pos+1:-1]
                             try:
-                                # 解析时间格式：年/月/日/小时:分钟 -> %Y/%m/%d/%H:%M
-                                expire_time = time.strptime(end_time_str, "%Y/%m/%d/%H:%M")
-                                expire_timestamp = time.mktime(expire_time)
+                                # 解析时间格式：年/月/日/小时:分钟 -> datetime
+                                expire_time = datetime.strptime(end_time_str, "%Y/%m/%d/%H:%M")
                                 # 如果记忆未过期，保留
-                                if expire_timestamp > current_timestamp:
+                                if expire_time > current_dt:
                                     updated_lines.append(line)
                             except ValueError:
                                 # 如果时间格式不正确，保留该行
@@ -228,6 +428,9 @@ if __name__ == "__main__":
             print(f"读取提示词文件时发生错误：{e}，将使用默认提示词")
             return "你是一个AI助手，使用中文交流。"
     
+    # 启动每日零点定时整理（不在启动时立即整理）
+    start_daily_memory_manager()
+
     # 首次读取提示词
     current_prompt = read_prompt_from_file()
     last_prompt_content = current_prompt
@@ -334,32 +537,46 @@ if __name__ == "__main__":
                 
                 # 6. 处理API返回结果
                 if memory_answer.strip().upper() == "NO":
-                    return  # 如果回答是NO，不用理会
-                
-                # 7. 如果有内容，写入初始提示词中
-                if memory_answer.strip():
-                    # 获取当前时间，格式：年/月/日/h:m
-                    current_time = time.strftime("%Y/%m/%d/%H:%M")
-                    # 构建要写入的内容
-                    new_memory_line = f"<{current_time}> {memory_answer.strip()}"
-                    
-                    # 8. 找到===END_INITIAL_PROMPT===的位置，在其之前插入新内容
-                    end_prompt_marker = "===END_INITIAL_PROMPT==="
-                    end_marker_pos = full_content.find(end_prompt_marker)
-                    if end_marker_pos != -1:
-                        # 在===END_INITIAL_PROMPT===之前插入新内容和换行
-                        updated_content = full_content[:end_marker_pos] + new_memory_line + "\n" + full_content[end_marker_pos:]
-                        # 写入更新后的内容
-                        with open("system_prompt.txt", "w", encoding="utf-8") as f:
-                            f.write(updated_content)
+                    return  # ?????NO?????
+
+                normalized_memory = memory_answer.strip()
+                # ??????????<????>?????????????????
+                normalized_memory = re.sub(
+                    r'^\s*<\d{4}/\d{2}/\d{2}/\d{2}:\d{2}>\s*',
+                    '',
+                    normalized_memory
+                ).strip()
+
+                # ???????????<????>??????????
+                if not normalized_memory:
+                    return
+                if not re.search(r'<\d{4}/\d{2}/\d{2}/\d{2}:\d{2}>\s*$', normalized_memory):
+                    return
+
+                # 7. ??????????????
+                # ???????????/?/?/h:m
+                current_time = time.strftime("%Y/%m/%d/%H:%M")
+                # ????????
+                new_memory_line = f"<{current_time}> {normalized_memory}"
+
+                # 8. ??===END_INITIAL_PROMPT===?????????????
+                end_prompt_marker = "===END_INITIAL_PROMPT==="
+                end_marker_pos = full_content.find(end_prompt_marker)
+                if end_marker_pos != -1:
+                    # ?===END_INITIAL_PROMPT===??????????
+                    updated_content = full_content[:end_marker_pos] + new_memory_line + "\n" + full_content[end_marker_pos:]
+                    # ????????
+                    with open("system_prompt.txt", "w", encoding="utf-8") as f:
+                        f.write(updated_content)
             except Exception as e:
                 pass  # 静默处理错误，不影响主程序运行
         
         # 调用API并保存对话历史，传递当前提示词
+        question_for_model = maybe_route_and_call_mcp(question)
         start_time = time.time()
         answer, chat_history = call_deepseek_api(
             YOUR_API_KEY, 
-            question, 
+            question_for_model, 
             stream=True, 
             chat_history=chat_history,
             system_prompt=current_prompt
